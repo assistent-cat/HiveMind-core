@@ -12,6 +12,11 @@ import json
 from jarbas_hive_mind.discovery.ssdp import SSDPServer
 from jarbas_hive_mind.discovery.upnp_server import UPNPHTTPServer
 from jarbas_hive_mind.discovery.zero import ZeroConfAnnounce
+from jarbas_hive_mind.speech.listener import WebsocketAudioListener
+from jarbas_hive_mind.speech.speaker import WebsocketAudioSource
+
+from mycroft.tts import TTSFactory
+
 import uuid
 
 platform = "HiveMindV0.7"
@@ -163,6 +168,12 @@ class HiveMind(WebSocketServerFactory):
         self.upnp_server = None
         self.ssdp = None
         self.zero = None
+        
+        # AudioSource for streaming TTS through WS
+        self.tts = TTSFactory.create()
+        self.audio_source_queue = Queue()
+        self.audio_source = WebsocketAudioSource(self.audio_source_queue, self.tts)
+        self.audio_source.start()
 
     def start_announcing(self):
         device_uuid = uuid.uuid4()
@@ -250,9 +261,16 @@ class HiveMind(WebSocketServerFactory):
             #  if not whitelisted kick
             self.unregister_client(client, reason="Unknown ip")
             return
+            
+        audio_queue = Queue()
+        audio_listener = WebsocketAudioListener(
+            self, client, audio_queue)
         self.clients[client.peer] = {"instance": client,
                                      "status": "connected",
-                                     "platform": platform}
+                                     "platform": platform,
+                                     "audio_queue": audio_queue,
+                                     "audio_listener": audio_listener}
+        audio_listener.start()
 
     def unregister_client(self, client, code=3078,
                           reason="unregister client request"):
@@ -263,6 +281,10 @@ class HiveMind(WebSocketServerFactory):
         LOG.info("deregistering client: " + str(client.peer))
         if client.peer in self.clients.keys():
             client_data = self.clients[client.peer] or {}
+            audio_listener = client_data.get("audio_listener")
+            if audio_listener:
+                LOG.info("stopping audio listener")
+                audio_listener.stop()
             j, ip, sock_num = client.peer.split(":")
             context = {"user": client_data.get("names", ["unknown_user"])[0],
                        "source": client.peer}
@@ -280,8 +302,12 @@ class HiveMind(WebSocketServerFactory):
         client_protocol, ip, sock_num = client.peer.split(":")
 
         if isBinary:
-            # TODO receive files
-            pass
+            audio_queue = self.clients[client.peer].get("audio_queue")
+            if audio_queue:
+                try:
+                    audio_queue.put(payload)
+                except Exception as e:
+                    LOG.error("Could not put audio in queue: " + e)
         else:
             # Check protocol
             data = json.loads(payload)
@@ -308,6 +334,19 @@ class HiveMind(WebSocketServerFactory):
                 self.handle_escalate_message(data, client)
 
     # HiveMind protocol messages -  from DOWNstream
+    def emit_utterance_to_bus(self, client, utterance):
+        bus_message = {
+            "type": "recognizer_loop:utterance",
+            "data": {
+                "utterances": [utterance],
+                "context": {
+                    "source": client.peer,
+                    "destination": ["skills"],
+                }
+            },
+        }
+        self.handle_bus_message(bus_message, client)
+        
     def handle_bus_message(self, payload, client):
         # Generate mycroft Message
         if isinstance(payload, str):
